@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes">
+    <title>Cube and Hexa</title>
+    <link rel="icon" type="image/png" href="TemplateData/game-icon.png">
+    <link rel="stylesheet" href="TemplateData/style.css">
+    <style>
+      /* ===== Ideofuzion template - responsive letterbox + loading UI =====
+         All overrides live inline here because Unity regenerates TemplateData/style.css
+         on every build; !important beats it. Cube and Hexa is a portrait (9:16) game. */
+
+      html, body {
+        margin: 0; padding: 0; width: 100%; height: 100%;
+        overflow: hidden; background: #0e0e12;
+        touch-action: none;                 /* don't let the browser eat drags/clicks */
+        -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+      }
+
+      /* Full-viewport shell. The game's own key art, blurred and darkened, sits behind the
+         loading bar so a player can tell what is loading while the icon and the bar stay the
+         only things in focus. Baked into a small JPG by Tools/bake_loading_bg.py - never a CSS
+         filter: blur(), which is expensive on phones and this screen has to render precisely
+         while the device is downloading tens of megabytes of wasm.
+
+         'cover', never '100% 100%': cover crops, stretch distorts, and portrait art stretched
+         into a letterboxed viewport looks broken.
+
+         #0e0e12 stays underneath as the fallback if the JPG is slow - it is identical to GROUND
+         in the bake script, and it is also what paints the letterbox bars. */
+      #unity-container {
+        position: fixed; inset: 0;
+        background: #0e0e12 url('TemplateData/loading-bg.jpg') center / cover no-repeat;
+      }
+
+      /* Canvas is positioned by JS (letterbox). Transparent so the backdrop shows through
+         while loading; Unity fills it once the game renders. */
+      #unity-canvas {
+        display: block; position: absolute;
+        background: transparent !important;
+      }
+
+      /* ---- Loading bar ---- */
+      #unity-loading-bar {
+        position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+        display: none; z-index: 10; text-align: center;
+      }
+      #unity-logo {
+        width: 180px; height: 180px; margin: 0 auto 12px;
+        background: url('TemplateData/game-icon.png') center / contain no-repeat;
+      }
+      #unity-progress-bar-empty {                 /* track */
+        width: 300px; height: 18px; margin: 12px auto 0;
+        background: #d9d9d9 !important; background-image: none !important;
+        border-radius: 9px; overflow: hidden;
+      }
+      #unity-progress-bar-full {                  /* fill */
+        width: 0%; height: 100%;
+        background: #1C3A5B !important; background-image: none !important;
+        margin-top: 0 !important;                 /* fix: default style.css pushes it down */
+        border-radius: 9px; transition: width 0.1s ease;
+      }
+      #unity-progress-percent {                   /* % readout */
+        color: #F2F2F2; font: 14px arial, sans-serif; margin-top: 6px;
+      }
+
+      /* Placeholder shown while we decide WHICH icon to display. Created by JS, never by
+         CSS, so a script failure leaves the build icon visible instead of a stray spinner.
+         position:absolute keeps it out of flow - removing it must not reflow the layout and
+         make the icon jump. */
+      #gb-icon-spinner {
+        position: absolute; top: 58px; left: calc(50% - 32px);
+        width: 64px; height: 64px;
+        border: 6px solid rgba(255, 255, 255, 0.18);
+        border-top-color: #F2F2F2;
+        border-radius: 50%;
+        animation: gb-spin 0.9s linear infinite;
+      }
+      @keyframes gb-spin { to { transform: rotate(360deg); } }
+
+      /* No footer in this build. */
+      #unity-footer { display: none !important; }
+      #unity-warning {
+        position: absolute; left: 50%; top: 5%; transform: translate(-50%);
+        background: white; padding: 10px; display: none; z-index: 20;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" width=1080 height=1920 tabindex="-1"></canvas>
+      <div id="unity-loading-bar">
+        <div id="unity-logo"></div>
+        <div id="unity-progress-bar-empty"><div id="unity-progress-bar-full"></div></div>
+        <div id="unity-progress-percent">0%</div>
+      </div>
+      <div id="unity-warning"> </div>
+    </div>
+    <script>
+      // Bump this before every build. It is the only way to tell from the browser console
+      // WHICH build is actually on screen, and a cached wasm makes that question come up
+      // constantly - hard-refresh in a private window when the answer looks wrong.
+      //
+      // BUILD_ENV is rewritten by GameBullBuild.SetEnvironment alongside DEFAULT_API_BASE
+      // below, so the label cannot claim one environment while the game talks to the other.
+      // Hand-editing it is how a production build ends up announcing itself as staging.
+      var BUILD_VERSION = "2026-09-04-4";
+      var BUILD_ENV     = "production";
+      console.log("[Cube and Hexa] build " + BUILD_VERSION + " (" + BUILD_ENV + ")");
+
+      // ===== Dynamic loading icon (GameBull /context) ==============================
+      // The loading screen renders BEFORE Unity boots, so C# cannot set this - it has to
+      // happen here.
+      //
+      // DECIDE BEFORE REVEALING. The icon area starts hidden behind a spinner and exactly
+      // ONE icon is ever shown: the admin's if /context supplies one, otherwise the build's.
+      // Revealing the build icon first and swapping later would show two different icons in
+      // sequence, which looks like a glitch.
+      //
+      // Fire-and-forget: never blocks or delays the Unity build download.
+      (function applyPartnerLoadingIcon() {
+        var DEFAULT_API_BASE   = "https://api.g-b.store";
+        var REVEAL_DEADLINE_MS = 4000;
+
+        var revealed = false;
+        var spinner  = null;
+
+        function removeSpinner() {
+          if (spinner && spinner.parentNode) { spinner.parentNode.removeChild(spinner); }
+          spinner = null;
+        }
+
+        // Idempotent: whichever path finishes first wins, the rest are no-ops.
+        // iconUrl === null means "show the build icon".
+        function reveal(iconUrl) {
+          if (revealed) { return; }
+          revealed = true;
+          var el = document.querySelector("#unity-logo");
+          if (el) {
+            if (iconUrl) {
+              el.style.backgroundImage = 'url("' + iconUrl.replace(/"/g, "%22") + '")';
+            }
+            el.style.visibility = "visible";
+          }
+          removeSpinner();
+        }
+
+        try {
+          // Hidden from JS, NOT from CSS. If this script never runs at all, the build icon
+          // must still appear - a CSS rule would hide it permanently.
+          var logo = document.querySelector("#unity-logo");
+          if (logo) { logo.style.visibility = "hidden"; }
+
+          var bar = document.querySelector("#unity-loading-bar");
+          if (bar) {
+            spinner = document.createElement("div");
+            spinner.id = "gb-icon-spinner";
+            bar.appendChild(spinner);
+          }
+
+          // Hard backstop: a slow or unreachable API must never leave the icon hidden.
+          setTimeout(function () { reveal(null); }, REVEAL_DEADLINE_MS);
+
+          var q          = new URLSearchParams(window.location.search);
+          var tenantSlug = q.get("tenantSlug");
+          var token      = q.get("sessionToken") || q.get("bootToken") || q.get("token");
+          var apiBase    = q.get("apiBase") || DEFAULT_API_BASE;
+          var gameId     = q.get("gameId");
+
+          // gameId is read from the URL only - never hardcoded. A guessed id that does not
+          // match this game is still a VALID id for a different game, which would silently
+          // show that game's logo here.
+          if (!tenantSlug || !token || !gameId) { reveal(null); return; }
+
+          var controller = new AbortController();
+          setTimeout(function () { controller.abort(); }, REVEAL_DEADLINE_MS);
+
+          var url = apiBase.replace(/\/+$/, "")
+                  + "/play/games/" + encodeURIComponent(gameId)
+                  + "/context?tenantSlug=" + encodeURIComponent(tenantSlug);
+
+          fetch(url, {
+            method: "GET",
+            headers: { "Authorization": "Bearer " + token },
+            signal: controller.signal
+          })
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+              var c = (data && data.customization) || {};
+
+              // PER-GAME fields only. logoUrl / tenantLogoUrl / assets[] are tenant-wide and
+              // return another game's artwork on a shared test tenant.
+              var iconUrl =
+                (typeof c.gameLogoUrl   === "string" && c.gameLogoUrl)   ? c.gameLogoUrl   :
+                (typeof c.gameBannerUrl === "string" && c.gameBannerUrl) ? c.gameBannerUrl : null;
+
+              if (!iconUrl) { reveal(null); return; }   // no admin icon -> build icon
+
+              // Preload: reveal only once it has actually decoded, so a broken or slow
+              // image never appears half-drawn or leaves the spinner up forever.
+              var img = new Image();
+              img.onload  = function () { reveal(iconUrl); };
+              img.onerror = function () { reveal(null); };
+              img.src = iconUrl;
+            })
+            .catch(function () { reveal(null); });
+        } catch (e) {
+          reveal(null);
+        }
+      })();
+      // =============================================================================
+
+      var canvas = document.querySelector("#unity-canvas");
+
+      // ===== Responsive letterbox: largest rect of the game's aspect that fits, centered =====
+      // Aspect comes from the player's web canvas size (Player Settings -> 1080 x 1920 = 9:16).
+      var GAME_ASPECT = 1080 / 1920;
+      function resizeCanvas() {
+        var availW = window.innerWidth, availH = window.innerHeight, w, h;
+        if (availW / availH > GAME_ASPECT) { h = availH; w = Math.round(h * GAME_ASPECT); }
+        else                               { w = availW; h = Math.round(w / GAME_ASPECT); }
+        canvas.style.width  = w + "px";
+        canvas.style.height = h + "px";
+        canvas.style.left   = Math.round((availW - w) / 2) + "px";
+        canvas.style.top    = Math.round((availH - h) / 2) + "px";
+      }
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
+
+      // ===== Single source of truth for the loading bar + percent =====
+      function setLoadProgress(p) {
+        var pct  = Math.round(p * 100);
+        var full = document.querySelector("#unity-progress-bar-full");
+        var txt  = document.querySelector("#unity-progress-percent");
+        if (full) full.style.width = pct + "%";
+        if (txt)  txt.innerText    = pct + "%";
+      }
+
+      function unityShowBanner(msg, type) {
+        var warningBanner = document.querySelector("#unity-warning");
+        function updateBannerVisibility() {
+          warningBanner.style.display = warningBanner.children.length ? 'block' : 'none';
+        }
+        var div = document.createElement('div');
+        div.innerHTML = msg;
+        warningBanner.appendChild(div);
+        if (type == 'error') div.style = 'background: red; padding: 10px;';
+        else {
+          if (type == 'warning') div.style = 'background: yellow; padding: 10px;';
+          setTimeout(function () { warningBanner.removeChild(div); updateBannerVisibility(); }, 5000);
+        }
+        updateBannerVisibility();
+      }
+
+      var buildUrl = "Build";
+      var loaderUrl = buildUrl + "/prodbuild.loader.js";
+      var config = {
+        arguments: [],
+        dataUrl: buildUrl + "/prodbuild.data.unityweb",
+        frameworkUrl: buildUrl + "/prodbuild.framework.js.unityweb",
+        codeUrl: buildUrl + "/prodbuild.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "DefaultCompany",
+        productName: "Cube and Hexa",
+        productVersion: "1.3",
+        showBanner: unityShowBanner,
+        // Render buffer tracks the CSS (letterboxed) canvas size -> responsive, no distortion.
+        matchWebGLToCanvasSize: true,
+      };
+
+      document.querySelector("#unity-loading-bar").style.display = "block";
+
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      script.onload = () => {
+        createUnityInstance(canvas, config, setLoadProgress).then((unityInstance) => {
+          window.unityInstance = unityInstance;
+
+          // Force 100% before hiding (Unity's onProgress plateaus at 0.9).
+          setLoadProgress(1);
+
+          // Safari/WebKit keeps painting loading elements even after display:none on a parent.
+          // Hide each explicitly, clear its background image, then REMOVE it from the DOM.
+          function killEl(sel) {
+            var el = document.querySelector(sel);
+            if (!el) return;
+            el.style.display = "none";
+            el.style.visibility = "hidden";
+            el.style.opacity = "0";
+            el.style.backgroundImage = "none";
+            if (el.parentNode) el.parentNode.removeChild(el);
+          }
+          killEl("#gb-icon-spinner");   // in case Unity loaded before the icon was decided
+          killEl("#unity-logo");
+          killEl("#unity-progress-bar-full");
+          killEl("#unity-progress-bar-empty");
+          killEl("#unity-progress-percent");
+          killEl("#unity-loading-bar");
+
+          resizeCanvas();
+
+          // ===== Page <-> game bridge (GameBull) =====
+          // Cube and Hexa reads its boot params straight from the URL query string in
+          // GameBullBoot, so we only announce readiness here. If a SendMessage-style
+          // handshake is ever needed, forward the payload via
+          // unityInstance.SendMessage('<BridgeObject>', '<Method>', payload).
+          try { window.parent.postMessage({ type: 'game:ready' }, '*'); } catch (e) {}
+        }).catch((message) => { alert(message); });
+      };
+      document.body.appendChild(script);
+    </script>
+  </body>
+</html>

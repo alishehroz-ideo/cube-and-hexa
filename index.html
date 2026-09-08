@@ -29,7 +29,15 @@
          into a letterboxed viewport looks broken.
 
          #0e0e12 stays underneath as the fallback if the JPG is slow - it is identical to GROUND
-         in the bake script, and it is also what paints the letterbox bars. */
+         in Tools/bake_loading_bg.py, and it is also what paints the letterbox bars.
+
+         *** THIS ELEMENT IS THE FULL VIEWPORT, so its background paints the LETTERBOX BARS as
+         well as the loading screen. The image is therefore TORN DOWN in JS the moment Unity
+         renders - search for "container.style.background" in the createUnityInstance().then()
+         handler below. Without that teardown, a band of blurred key art sits above and below
+         the game for the entire session with a seam at the canvas edge, and it reads as the
+         game rendering wrong rather than as a loading leftover. Change one half, change the
+         other: they are forty lines and one language apart. *** */
       #unity-container {
         position: fixed; inset: 0;
         background: #0e0e12 url('TemplateData/loading-bg.jpg') center / cover no-repeat;
@@ -106,7 +114,7 @@
       // BUILD_ENV is rewritten by GameBullBuild.SetEnvironment alongside DEFAULT_API_BASE
       // below, so the label cannot claim one environment while the game talks to the other.
       // Hand-editing it is how a production build ends up announcing itself as staging.
-      var BUILD_VERSION = "2026-09-04-4";
+      var BUILD_VERSION = "2026-09-04-5";
       var BUILD_ENV     = "production";
       console.log("[Cube and Hexa] build " + BUILD_VERSION + " (" + BUILD_ENV + ")");
 
@@ -298,6 +306,20 @@
           killEl("#unity-progress-bar-empty");
           killEl("#unity-progress-percent");
           killEl("#unity-loading-bar");
+
+          // The backdrop is a LOADING backdrop, so it comes down with the rest of the loading
+          // UI. #unity-container is the FULL VIEWPORT and the canvas is letterboxed inside it,
+          // which means that background is also what paints the LETTERBOX BARS - leaving the
+          // image set keeps a band of blurred key art above and below the game for the whole
+          // session, with a visible seam at the canvas edge. That does not read as a loading
+          // leftover, it reads as the game rendering wrong.
+          //
+          // Harmless for as long as the background was a flat colour; not harmless the moment
+          // it became a picture. See the #unity-container rule in the <style> block above -
+          // these two halves are forty lines and one language apart, which is exactly how this
+          // gets separated again. The colour must match GROUND in Tools/bake_loading_bg.py.
+          var container = document.querySelector("#unity-container");
+          if (container) container.style.background = "#0e0e12";
 
           resizeCanvas();
 
